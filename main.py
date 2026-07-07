@@ -1,7 +1,8 @@
 ﻿from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import func
 
-from nfce_scraper import scrape_nfce
+from nfce_scraper import SefazBlockedError, scrape_nfce
 from nfce_service import salvar_compra
 
 from database import Base, engine, SessionLocal
@@ -19,7 +20,10 @@ class NFCeRequest(BaseModel):
 
 @app.post("/nfce")
 def read_nfce(data: NFCeRequest):
-    resultado = scrape_nfce(data.url)
+    try:
+        resultado = scrape_nfce(data.url)
+    except SefazBlockedError as error:
+        raise HTTPException(status_code=424, detail=str(error))
 
     items = resultado.get("items") or []
     if len(items) == 0:
@@ -83,6 +87,40 @@ def listar_compras():
 
     db.close()
     return resultado
+
+
+@app.get("/gastos-mensais")
+def listar_gastos_mensais():
+    db = SessionLocal()
+
+    try:
+        # SQLite: agrupa por ano-mes usando strftime para manter ordenacao correta.
+        rows = (
+            db.query(
+                func.strftime("%Y-%m", Compra.data).label("ano_mes"),
+                func.sum(Compra.valor_pago).label("total"),
+            )
+            .group_by(func.strftime("%Y-%m", Compra.data))
+            .order_by(func.strftime("%Y-%m", Compra.data))
+            .all()
+        )
+
+        if not rows:
+            return []
+
+        resultado = []
+        for ano_mes, total in rows:
+            ano, mes = ano_mes.split("-")
+            resultado.append(
+                {
+                    "mes": f"{mes}/{ano}",
+                    "total": float(total or 0.0),
+                }
+            )
+
+        return resultado
+    finally:
+        db.close()
     
 
 

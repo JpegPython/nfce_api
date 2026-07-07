@@ -1,5 +1,7 @@
 ﻿import re
 from playwright.sync_api import sync_playwright
+import urllib.parse
+import urllib.request
 from bs4 import BeautifulSoup
 from datetime import datetime
 
@@ -8,6 +10,10 @@ IGNORED_NAME_PATTERNS = (
     r"^vl\.?\s*total",
     r"^valor\s+total",
 )
+
+
+class SefazBlockedError(Exception):
+    pass
 
 
 def _is_valid_product_name(raw_name: str) -> bool:
@@ -40,6 +46,227 @@ def _parse_brl_value(raw_value: str | None) -> float | None:
         return None
 
     return float(match.group(0))
+
+
+def _first_text(root, selectors: tuple[str, ...]) -> str:
+    for selector in selectors:
+        tag = root.select_one(selector)
+        if not tag:
+            continue
+        text = _normalize_whitespace(tag.get_text(" ", strip=True))
+        if text:
+            return text
+    return ""
+
+
+def _find_item_nodes(soup: BeautifulSoup):
+    nodes = []
+    seen = set()
+
+    # Layouts de NFC-e variam por UF: alguns usam tr#Item..., outros div/li#Item...
+    for selector in (
+        '[id^="Item"]',
+        '[id*="Item"]',
+        '#tabResult tr',
+        '#tabResult li',
+        '#tabResult > div',
+    ):
+        for node in soup.select(selector):
+            key = id(node)
+            if key in seen:
+                continue
+
+            text = _normalize_whitespace(node.get_text(" ", strip=True))
+            if not text:
+                continue
+
+            lowered = text.lower()
+            if not any(token in lowered for token in ("qtd", "qtde", "vl", "valor", "un", "unit")):
+                continue
+
+            seen.add(key)
+            nodes.append(node)
+
+    return nodes
+
+
+def _extract_item_name(item_row) -> str:
+    name = _first_text(
+        item_row,
+        (
+            ".txtTit",
+            "[class*='txtTit']",
+            ".produto",
+            ".nome",
+            ".descricao",
+            "td:first-child span",
+            "td:first-child",
+        ),
+    )
+
+    if name:
+        return name
+
+    row_text = _normalize_whitespace(item_row.get_text(" ", strip=True))
+    name_match = re.match(
+        r"(.+?)(?:\s+(?:c[oó]digo|cod\.?|qtd(?:e)?\.?|qtde\.?|un(?:it)?\.?|vl\.?|valor)\s*:)",
+        row_text,
+        re.I,
+    )
+    if name_match:
+        return _normalize_whitespace(name_match.group(1))
+
+    return ""
+
+
+def _extract_item_total(item_row) -> float | None:
+    value_text = _first_text(
+        item_row,
+        (
+            "td[align='right'] .valor",
+            ".valor",
+            "[class*='valor']",
+            "[class*='Valor']",
+            "td[align='right']",
+        ),
+    )
+    value = _parse_brl_value(value_text)
+    if value is not None:
+        return value
+
+    row_text = _normalize_whitespace(item_row.get_text(" ", strip=True))
+    total_match = re.search(
+        r"(?:vl\.?\s*total|valor\s*total|total)\s*:?\s*R?\$?\s*(-?\d+[\.,]\d+)",
+        row_text,
+        re.I,
+    )
+    if total_match:
+        return _parse_brl_value(total_match.group(1))
+
+    money_values = re.findall(r"R?\$?\s*(-?\d+[\.,]\d{2})", row_text)
+    if money_values:
+        return _parse_brl_value(money_values[-1])
+
+    return None
+
+
+def _save_debug_html(html: str, reason: str) -> None:
+    try:
+        with open("last_nfce_debug.html", "w", encoding="utf-8") as debug_file:
+            debug_file.write(html)
+        print(f"HTML de debug salvo em last_nfce_debug.html ({reason})")
+    except OSError as error:
+        print(f"Nao foi possivel salvar HTML de debug: {error}")
+
+
+def _detect_blocked_page(soup: BeautifulSoup) -> str | None:
+    html_text = str(soup).lower()
+    page_text = _normalize_whitespace(soup.get_text(" ", strip=True)).lower()
+
+    if "recaptcharesponse" in html_text or "google.com/recaptcha" in html_text:
+        return (
+            "A SEFAZ retornou uma pagina intermediaria com reCAPTCHA. "
+            "A consulta automatica da NFC-e do RJ foi bloqueada antes de exibir os produtos."
+        )
+
+    if "/tspd/" in html_text or "apm_do_not_touch" in html_text:
+        return (
+            "A SEFAZ retornou uma pagina de protecao anti-bot antes de exibir os produtos."
+        )
+
+    if "captcha" in page_text:
+        return "A SEFAZ solicitou captcha antes de exibir os produtos."
+
+    return None
+
+
+def _encode_nfce_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+
+    if not query:
+        return url
+
+    encoded_query = urllib.parse.urlencode(query)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment)
+    )
+
+
+def _fetch_html_direct(url: str) -> str:
+    encoded_url = _encode_nfce_url(url)
+    request = urllib.request.Request(
+        encoded_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        status = getattr(response, "status", None)
+        final_url = response.geturl()
+        content_type = response.headers.get("Content-Type", "")
+        raw_body = response.read()
+
+    print("Status SEFAZ direto:", status)
+    print("URL final direta:", final_url)
+    print("Content-Type SEFAZ:", content_type)
+
+    charset_match = re.search(r"charset=([\w-]+)", content_type, re.I)
+    charset = charset_match.group(1) if charset_match else "iso-8859-1"
+
+    return raw_body.decode(charset, errors="replace")
+
+
+def _fetch_html_playwright(url: str) -> str:
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="pt-BR",
+            viewport={"width": 1280, "height": 720}
+        )
+
+        page = context.new_page()
+        response = page.goto(
+            _encode_nfce_url(url),
+            timeout=60000,
+            wait_until="domcontentloaded"
+        )
+
+        print("Status SEFAZ Playwright:", response.status if response else "sem resposta")
+        print("URL final Playwright:", page.url)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            print("Network idle nao ocorreu dentro do tempo; seguindo com HTML renderizado.")
+
+        try:
+            page.wait_for_selector('[id^="Item"], #tabResult, .txtTit', timeout=10000)
+        except Exception:
+            print("Nenhum seletor conhecido de itens apareceu dentro do tempo.")
+
+        page.wait_for_timeout(1500)
+
+        html = page.content()
+
+        browser.close()
+
+    return html
 
 
 def _extract_store_info(soup: BeautifulSoup) -> tuple[str | None, str | None]:
@@ -304,37 +531,24 @@ def scrape_nfce(url: str):
 
     data_compra = None
 
-    with sync_playwright() as p:
+    print("Abrindo NFCe...")
 
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+    try:
+        html = _fetch_html_direct(url)
+    except Exception as error:
+        print(f"Falha na consulta direta da SEFAZ: {error}")
+        html = ""
 
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="pt-BR",
-            viewport={"width": 1280, "height": 720}
-        )
-
-        page = context.new_page()
-        print("Abrindo NFCe...")
-
-        page.goto(
-            url,
-            timeout=60000,
-            wait_until="networkidle"
-        )
-
-        # aguarda renderização dos itens
-        page.wait_for_timeout(4000)
-
-        html = page.content()
-
-        browser.close()
+    if not _normalize_whitespace(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)):
+        print("Consulta direta retornou pagina vazia; tentando Playwright.")
+        html = _fetch_html_playwright(url)
 
     soup = BeautifulSoup(html, "html.parser")
+
+    blocked_reason = _detect_blocked_page(soup)
+    if blocked_reason:
+        _save_debug_html(html, "bloqueio sefaz")
+        raise SefazBlockedError(blocked_reason)
 
     mercado_nome, mercado_endereco = _extract_store_info(soup)
 
@@ -354,22 +568,23 @@ def scrape_nfce(url: str):
 
     totais = _extract_totals_and_payment(soup)
 
-    item_rows = soup.select('tr[id^="Item"]')
+    item_rows = _find_item_nodes(soup)
 
     print("Produtos encontrados:", len(item_rows))
 
-    for item_row in item_rows:
-        produto = item_row.select_one("td span.txtTit")
-        if not produto:
-            continue
+    if not item_rows:
+        page_text = _normalize_whitespace(soup.get_text(" ", strip=True))
+        print("Titulo da pagina:", _normalize_whitespace(soup.title.get_text(" ", strip=True) if soup.title else ""))
+        print("Amostra da pagina:", page_text[:500])
+        _save_debug_html(html, "zero itens")
 
-        nome = produto.get_text(" ", strip=True)
+    for item_row in item_rows:
+        nome = _extract_item_name(item_row)
 
         if not _is_valid_product_name(nome):
             continue
 
-        preco_tag = item_row.select_one("td[align='right'] .valor") or item_row.select_one(".valor")
-        preco = _parse_brl_value(preco_tag.get_text(" ", strip=True) if preco_tag else None)
+        preco = _extract_item_total(item_row)
 
         if preco is None:
             continue
