@@ -1,6 +1,10 @@
-﻿import re
+﻿import os
+import re
+import threading
+import time
 from playwright.sync_api import sync_playwright
 import urllib.parse
+import urllib.error
 import urllib.request
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -14,6 +18,21 @@ IGNORED_NAME_PATTERNS = (
 
 class SefazBlockedError(Exception):
     pass
+
+
+class SefazNotFoundError(Exception):
+    pass
+
+
+class SefazTemporaryError(Exception):
+    pass
+
+
+SEFAZ_MIN_INTERVAL_SECONDS = float(os.getenv("SEFAZ_MIN_INTERVAL_SECONDS", "0"))
+SEFAZ_MAX_RETRIES = int(os.getenv("SEFAZ_MAX_RETRIES", "2"))
+SEFAZ_RETRY_BASE_SECONDS = float(os.getenv("SEFAZ_RETRY_BASE_SECONDS", "5"))
+_sefaz_request_lock = threading.Lock()
+_last_sefaz_request_at = 0.0
 
 
 def _is_valid_product_name(raw_name: str) -> bool:
@@ -162,22 +181,82 @@ def _save_debug_html(html: str, reason: str) -> None:
 def _detect_blocked_page(soup: BeautifulSoup) -> str | None:
     html_text = str(soup).lower()
     page_text = _normalize_whitespace(soup.get_text(" ", strip=True)).lower()
+    support_id_match = re.search(r"support id\s*(?:is|:)?\s*:?\s*(\d+)", page_text, re.I)
+    support_id_text = f" Support ID: {support_id_match.group(1)}." if support_id_match else ""
+
+    has_nfce_content = (
+        bool(_find_item_nodes(soup))
+        or bool(soup.select_one("#totalNota, .txtTit, [id^='Item']"))
+        or "documento auxiliar da nota fiscal de consumidor eletrônica" in page_text
+        or "danfe nfc-e" in page_text
+    )
+
+    if has_nfce_content:
+        return None
 
     if "recaptcharesponse" in html_text or "google.com/recaptcha" in html_text:
         return (
             "A SEFAZ retornou uma pagina intermediaria com reCAPTCHA. "
             "A consulta automatica da NFC-e do RJ foi bloqueada antes de exibir os produtos."
+            f"{support_id_text}"
+        )
+
+    if "queremos saber se é humano ou robô" in page_text or "codigo da imagem" in page_text or "código da imagem" in page_text:
+        return (
+            "A SEFAZ solicitou captcha de imagem antes de exibir os produtos. "
+            "A consulta automatica da NFC-e do RJ foi bloqueada."
+            f"{support_id_text}"
         )
 
     if "/tspd/" in html_text or "apm_do_not_touch" in html_text:
         return (
             "A SEFAZ retornou uma pagina de protecao anti-bot antes de exibir os produtos."
+            f"{support_id_text}"
         )
 
     if "captcha" in page_text:
-        return "A SEFAZ solicitou captcha antes de exibir os produtos."
+        return f"A SEFAZ solicitou captcha antes de exibir os produtos.{support_id_text}"
 
     return None
+
+
+def _throttle_sefaz_request() -> None:
+    global _last_sefaz_request_at
+
+    if SEFAZ_MIN_INTERVAL_SECONDS <= 0:
+        return
+
+    elapsed = time.monotonic() - _last_sefaz_request_at
+    wait_seconds = SEFAZ_MIN_INTERVAL_SECONDS - elapsed
+    if wait_seconds > 0:
+        print(f"Aguardando {wait_seconds:.1f}s antes da proxima consulta SEFAZ.")
+        time.sleep(wait_seconds)
+    _last_sefaz_request_at = time.monotonic()
+
+
+def _is_retryable_status(status: int | None) -> bool:
+    return status in {408, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return _is_retryable_status(error.code)
+    return isinstance(error, (TimeoutError, urllib.error.URLError))
+
+
+def _retry_delay(attempt: int) -> float:
+    return SEFAZ_RETRY_BASE_SECONDS * (2 ** max(attempt - 1, 0))
+
+
+def _raise_for_empty_or_error_page(soup: BeautifulSoup) -> None:
+    page_text = _normalize_whitespace(soup.get_text(" ", strip=True))
+    lowered = page_text.lower()
+    title = _normalize_whitespace(soup.title.get_text(" ", strip=True) if soup.title else "")
+
+    if "error 404" in lowered or "404 - not found" in lowered or title.lower() == "error":
+        raise SefazNotFoundError(
+            "A SEFAZ retornou 404 para esta NFC-e. A URL/chave nao foi encontrada no endpoint consultado."
+        )
 
 
 def _encode_nfce_url(url: str) -> str:
@@ -193,7 +272,7 @@ def _encode_nfce_url(url: str) -> str:
     )
 
 
-def _fetch_html_direct(url: str) -> str:
+def _fetch_html_direct(url: str) -> tuple[str, int | None]:
     encoded_url = _encode_nfce_url(url)
     request = urllib.request.Request(
         encoded_url,
@@ -209,11 +288,17 @@ def _fetch_html_direct(url: str) -> str:
         },
     )
 
-    with urllib.request.urlopen(request, timeout=60) as response:
-        status = getattr(response, "status", None)
-        final_url = response.geturl()
-        content_type = response.headers.get("Content-Type", "")
-        raw_body = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            status = getattr(response, "status", None)
+            final_url = response.geturl()
+            content_type = response.headers.get("Content-Type", "")
+            raw_body = response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        final_url = error.geturl()
+        content_type = error.headers.get("Content-Type", "") if error.headers else ""
+        raw_body = error.read()
 
     print("Status SEFAZ direto:", status)
     print("URL final direta:", final_url)
@@ -222,10 +307,22 @@ def _fetch_html_direct(url: str) -> str:
     charset_match = re.search(r"charset=([\w-]+)", content_type, re.I)
     charset = charset_match.group(1) if charset_match else "iso-8859-1"
 
-    return raw_body.decode(charset, errors="replace")
+    html = raw_body.decode(charset, errors="replace")
+
+    if status == 404:
+        _save_debug_html(html, "sefaz 404 consulta direta")
+        raise SefazNotFoundError(
+            "A SEFAZ retornou 404 para esta NFC-e na consulta direta. "
+            "A URL/chave nao foi encontrada no endpoint consultado."
+        )
+
+    if _is_retryable_status(status):
+        raise SefazTemporaryError(f"A SEFAZ retornou status temporario {status} na consulta direta.")
+
+    return html, status
 
 
-def _fetch_html_playwright(url: str) -> str:
+def _fetch_html_playwright(url: str) -> tuple[str, int | None]:
     with sync_playwright() as p:
 
         browser = p.chromium.launch(
@@ -233,40 +330,68 @@ def _fetch_html_playwright(url: str) -> str:
             args=["--disable-blink-features=AutomationControlled"]
         )
 
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="pt-BR",
-            viewport={"width": 1280, "height": 720}
+        try:
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="pt-BR",
+                viewport={"width": 1280, "height": 720}
+            )
+
+            page = context.new_page()
+            response = page.goto(
+                _encode_nfce_url(url),
+                timeout=60000,
+                wait_until="domcontentloaded"
+            )
+
+            print("Status SEFAZ Playwright:", response.status if response else "sem resposta")
+            print("URL final Playwright:", page.url)
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                print("Network idle nao ocorreu dentro do tempo; seguindo com HTML renderizado.")
+
+            try:
+                page.wait_for_function(
+                    """
+                    () => {
+                        const text = document.body ? document.body.innerText : "";
+                        return document.querySelector('[id^="Item"], #tabResult, .txtTit')
+                            || text.includes("Documento Auxiliar da Nota Fiscal")
+                            || text.includes("DANFE NFC-e")
+                            || text.includes("QR Code");
+                    }
+                    """,
+                    timeout=30000,
+                )
+            except Exception:
+                print("A pagina renderizada nao apresentou conteudo conhecido da NFC-e dentro do tempo.")
+
+            try:
+                page.wait_for_selector('[id^="Item"], #tabResult, .txtTit', timeout=10000)
+            except Exception:
+                print("Nenhum seletor conhecido de itens apareceu dentro do tempo.")
+
+            page.wait_for_timeout(1500)
+
+            html = page.content()
+            status = response.status if response else None
+        finally:
+            browser.close()
+
+    if status == 404:
+        _save_debug_html(html, "sefaz 404 playwright")
+        raise SefazNotFoundError(
+            "A SEFAZ retornou 404 para esta NFC-e no navegador. "
+            "A URL/chave nao foi encontrada no endpoint consultado."
         )
 
-        page = context.new_page()
-        response = page.goto(
-            _encode_nfce_url(url),
-            timeout=60000,
-            wait_until="domcontentloaded"
-        )
+    if _is_retryable_status(status):
+        raise SefazTemporaryError(f"A SEFAZ retornou status temporario {status} no navegador.")
 
-        print("Status SEFAZ Playwright:", response.status if response else "sem resposta")
-        print("URL final Playwright:", page.url)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            print("Network idle nao ocorreu dentro do tempo; seguindo com HTML renderizado.")
-
-        try:
-            page.wait_for_selector('[id^="Item"], #tabResult, .txtTit', timeout=10000)
-        except Exception:
-            print("Nenhum seletor conhecido de itens apareceu dentro do tempo.")
-
-        page.wait_for_timeout(1500)
-
-        html = page.content()
-
-        browser.close()
-
-    return html
+    return html, status
 
 
 def _extract_store_info(soup: BeautifulSoup) -> tuple[str | None, str | None]:
@@ -525,23 +650,9 @@ def _extract_totals_and_payment(soup: BeautifulSoup) -> dict:
     return totals
 
 
-def scrape_nfce(url: str):
-
+def parse_nfce_html(html: str):
     items = []
-
     data_compra = None
-
-    print("Abrindo NFCe...")
-
-    try:
-        html = _fetch_html_direct(url)
-    except Exception as error:
-        print(f"Falha na consulta direta da SEFAZ: {error}")
-        html = ""
-
-    if not _normalize_whitespace(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)):
-        print("Consulta direta retornou pagina vazia; tentando Playwright.")
-        html = _fetch_html_playwright(url)
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -549,6 +660,8 @@ def scrape_nfce(url: str):
     if blocked_reason:
         _save_debug_html(html, "bloqueio sefaz")
         raise SefazBlockedError(blocked_reason)
+
+    _raise_for_empty_or_error_page(soup)
 
     mercado_nome, mercado_endereco = _extract_store_info(soup)
 
@@ -613,3 +726,51 @@ def scrape_nfce(url: str):
     "mercado_endereco": mercado_endereco,
     "forma_pagamento": totais.get("forma_pagamento"),
     }
+
+
+def _scrape_nfce_once(url: str):
+    print("Abrindo NFCe...")
+    _throttle_sefaz_request()
+
+    try:
+        html, _ = _fetch_html_direct(url)
+    except Exception as error:
+        if isinstance(error, (SefazNotFoundError, SefazTemporaryError)):
+            raise
+        print(f"Falha na consulta direta da SEFAZ: {error}")
+        html = ""
+
+    direct_soup = BeautifulSoup(html, "html.parser")
+    direct_blocked_reason = _detect_blocked_page(direct_soup) if html else None
+
+    if direct_blocked_reason:
+        _save_debug_html(html, "bloqueio sefaz consulta direta")
+        print("Consulta direta retornou pagina intermediaria da SEFAZ; tentando Playwright.")
+        html, _ = _fetch_html_playwright(url)
+    elif not _normalize_whitespace(direct_soup.get_text(" ", strip=True)):
+        print("Consulta direta retornou pagina vazia; tentando Playwright.")
+        html, _ = _fetch_html_playwright(url)
+
+    return parse_nfce_html(html)
+
+
+def scrape_nfce(url: str):
+    with _sefaz_request_lock:
+        last_error = None
+        for attempt in range(1, SEFAZ_MAX_RETRIES + 2):
+            try:
+                print(f"Tentativa SEFAZ {attempt}/{SEFAZ_MAX_RETRIES + 1}")
+                return _scrape_nfce_once(url)
+            except SefazTemporaryError as error:
+                last_error = error
+            except Exception as error:
+                if not _is_retryable_error(error):
+                    raise
+                last_error = error
+
+            if attempt <= SEFAZ_MAX_RETRIES:
+                delay = _retry_delay(attempt)
+                print(f"Falha temporaria na SEFAZ: {last_error}. Nova tentativa em {delay:.1f}s.")
+                time.sleep(delay)
+
+        raise SefazTemporaryError(f"A consulta da SEFAZ falhou apos retries: {last_error}")

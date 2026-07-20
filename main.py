@@ -2,29 +2,39 @@
 from pydantic import BaseModel
 from sqlalchemy import func
 
-from nfce_scraper import SefazBlockedError, scrape_nfce
+from nfce_scraper import (
+    SefazBlockedError,
+    SefazNotFoundError,
+    SefazTemporaryError,
+    parse_nfce_html,
+    scrape_nfce,
+)
 from nfce_service import salvar_compra
 
-from database import Base, engine, SessionLocal
+from database import SessionLocal, ensure_database_schema
 from models import Compra, ItemCompra, Produto
 
 # Criação das tabelas no banco
-Base.metadata.create_all(bind=engine)
+ensure_database_schema()
 
 app = FastAPI()
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 
 class NFCeRequest(BaseModel):
     url: str
 
 
-@app.post("/nfce")
-def read_nfce(data: NFCeRequest):
-    try:
-        resultado = scrape_nfce(data.url)
-    except SefazBlockedError as error:
-        raise HTTPException(status_code=424, detail=str(error))
+class NFCeHtmlRequest(BaseModel):
+    html: str
+    source_url: str | None = None
 
+
+def _salvar_resultado_nfce(resultado):
     items = resultado.get("items") or []
     if len(items) == 0:
         raise HTTPException(
@@ -50,6 +60,32 @@ def read_nfce(data: NFCeRequest):
         "mercado_endereco": resultado.get("mercado_endereco"),
         "forma_pagamento": resultado.get("forma_pagamento")
     }
+
+
+@app.post("/nfce")
+def read_nfce(data: NFCeRequest):
+    try:
+        resultado = scrape_nfce(data.url)
+    except SefazBlockedError as error:
+        raise HTTPException(status_code=424, detail=str(error))
+    except SefazNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    except SefazTemporaryError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+    return _salvar_resultado_nfce(resultado)
+
+
+@app.post("/nfce/html")
+def read_nfce_html(data: NFCeHtmlRequest):
+    try:
+        resultado = parse_nfce_html(data.html)
+    except SefazBlockedError as error:
+        raise HTTPException(status_code=424, detail=str(error))
+    except SefazNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+    return _salvar_resultado_nfce(resultado)
 
 
 @app.get("/compras")
@@ -121,6 +157,5 @@ def listar_gastos_mensais():
         return resultado
     finally:
         db.close()
-    
 
 

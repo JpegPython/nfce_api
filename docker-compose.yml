@@ -1,0 +1,14 @@
+services:
+  nfce-api:
+    build: .
+    container_name: nfce-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite:////app/data/market.db
+      SEFAZ_MIN_INTERVAL_SECONDS: "15"
+      SEFAZ_MAX_RETRIES: "2"
+      SEFAZ_RETRY_BASE_SECONDS: "5"
+    ports:
+      - "100.104.226.24:8001:8000"
+    volumes:
+      - ./data:/app/data

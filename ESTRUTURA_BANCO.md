@@ -2,8 +2,9 @@
 
 ## 1) Resumo tecnico
 - Banco: SQLite
-- Arquivo: `nfce_api/market.db`
-- URL de conexao na aplicacao: `sqlite:///./market.db`
+- Arquivo em Docker: `/app/data/market.db` (montado a partir de `nfce_api/data/market.db`)
+- Arquivo local fallback: `nfce_api/market.db`
+- URL de conexao na aplicacao: variavel `DATABASE_URL`; fallback `sqlite:///./market.db`
 - ORM: SQLAlchemy (declarative base)
 - Criacao de tabelas: `Base.metadata.create_all(bind=engine)` em `main.py`
 
@@ -115,6 +116,62 @@ Indices:
 ## 5) Relacionamentos
 - `compras (1) -> (N) itens_compra` via `itens_compra.compra_id`
 - `produtos (1) -> (N) itens_compra` via `itens_compra.produto_id`
+- `produtos_canonicos (1) -> (N) produtos` via `produtos.produto_canonico_id`
+- `categorias_produto (1) -> (N) produtos_canonicos` via `produtos_canonicos.categoria_id`
+
+## 5.1) Normalizacao e categorizacao de produtos
+- `produtos` continua sendo a fonte bruta da NFC-e, preservando o nome exatamente como veio da nota.
+- `produtos_canonicos` representa o produto normalizado aprovado para analises.
+- `categorias_produto` guarda a categoria analitica do produto canonico.
+- `sugestoes_normalizacao_produtos` guarda pares sugeridos para revisao antes de qualquer vinculacao.
+
+Comando para gerar sugestoes:
+```bash
+python normalizacao_produtos.py
+```
+
+Simular a vinculacao conservadora de todos os produtos ainda nao normalizados:
+```bash
+python normalizacao_produtos.py bootstrap --dry-run
+```
+
+Aplicar a vinculacao e completar categoria, marca e referencia de embalagem:
+```bash
+python normalizacao_produtos.py bootstrap
+```
+
+O `bootstrap` preserva o nome bruto em `produtos`, nao sobrescreve vinculos
+existentes e so reutiliza automaticamente um canonico quando o nome normalizado
+e exatamente igual. Aproximacoes continuam dependendo do fluxo de sugestoes.
+
+Comando para apenas simular:
+```bash
+python normalizacao_produtos.py --dry-run
+```
+
+No Docker:
+```bash
+docker compose exec nfce-api python normalizacao_produtos.py
+```
+
+Listar sugestoes pendentes:
+```bash
+python normalizacao_produtos.py list
+```
+
+Aprovar uma ou mais sugestoes:
+```bash
+python normalizacao_produtos.py approve 4 5
+```
+
+Rejeitar uma ou mais sugestoes:
+```bash
+python normalizacao_produtos.py reject 10
+```
+
+Ao aprovar, o comando cria ou reutiliza uma linha em `produtos_canonicos`,
+vincula os dois produtos brutos em `produtos.produto_canonico_id` e marca a
+sugestao como `aprovada`.
 
 ## 6) Regras de negocio observadas na persistencia (`nfce_service.py`)
 - Nao permite salvar compra sem itens.
@@ -128,7 +185,9 @@ Indices:
   - `desconto = 0.0`
 
 ## 7) Observacoes para uso por IA
-- Nao ha tabela de usuarios, fornecedores, categorias ou historico de preco nesta estrutura atual.
+- Nao ha tabela de usuarios, fornecedores ou historico de preco nesta estrutura atual.
+- Categorias analiticas ficam em `categorias_produto` e sao associadas aos
+  produtos por meio de `produtos_canonicos`.
 - Nao ha migracoes versionadas; o schema e criado/atualizado pelo SQLAlchemy no startup.
 - A consulta de gastos mensais agrega por `strftime('%Y-%m', compras.data)`.
 - Tipos numericos estao em `FLOAT`; para cenarios financeiros criticos, considerar migracao futura para tipo decimal (com validacao apropriada no backend).
@@ -138,4 +197,4 @@ Indices:
 - `nfce_api/database.py`
 - `nfce_api/nfce_service.py`
 - `nfce_api/main.py`
-- Schema real extraido de `nfce_api/market.db`
+- Schema real extraido de `nfce_api/data/market.db`

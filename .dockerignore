@@ -1,0 +1,9 @@
+.git
+.agents
+.codex
+.venv
+__pycache__
+*.pyc
+data
+market.db
+last_nfce_debug.html

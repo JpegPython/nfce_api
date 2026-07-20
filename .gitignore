@@ -201,6 +201,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local application state
+data/
+market.db
+last_nfce_debug.html
+.hermes/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
