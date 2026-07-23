@@ -9,6 +9,6 @@ services:
       SEFAZ_MAX_RETRIES: "2"
       SEFAZ_RETRY_BASE_SECONDS: "5"
     ports:
-      - "100.104.226.24:8001:8000"
+      - "localhost:8001:8000"
     volumes:
       - ./data:/app/data
