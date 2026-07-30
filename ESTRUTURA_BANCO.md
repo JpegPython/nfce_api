@@ -7,6 +7,9 @@
 - URL de conexao na aplicacao: variavel `DATABASE_URL`; fallback `sqlite:///./market.db`
 - ORM: SQLAlchemy (declarative base)
 - Criacao de tabelas: `Base.metadata.create_all(bind=engine)` em `main.py`
+- Evolucao compativel no startup: `ensure_database_schema()` adiciona
+  `compras.chave_acesso` e o indice unico `ix_compras_chave_acesso` quando
+  ainda nao existem.
 
 ## 2) Diagrama ER (visao geral)
 ```mermaid
@@ -204,3 +207,23 @@ sugestao como `aprovada`.
 - `nfce_api/nfce_service.py`
 - `nfce_api/main.py`
 - Schema real extraido de `nfce_api/data/market.db`
+
+## 9) Backup e restauracao
+
+O contêiner deve ser parado antes da copia para garantir um snapshot consistente:
+
+```bash
+docker compose stop nfce-api
+mkdir -p backups
+cp -p data/market.db backups/market-AAAAMMDDTHHMMSSZ.db
+```
+
+Valide a copia com um cliente SQLite:
+
+```sql
+PRAGMA integrity_check;
+```
+
+Para restaurar, mantenha a API parada, preserve uma copia do banco atual,
+substitua `data/market.db` pelo snapshot escolhido e inicie novamente o
+servico. `backups/` e ignorada pelo Git e pelo Docker.

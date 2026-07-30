@@ -5,5 +5,6 @@
 __pycache__
 *.pyc
 data
+backups
 market.db
 last_nfce_debug.html

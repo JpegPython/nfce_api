@@ -205,6 +205,7 @@ cython_debug/
 
 # Local application state
 data/
+backups/
 market.db
 last_nfce_debug.html
 sefaz_*_sample.html

@@ -155,3 +155,30 @@ Executar os testes:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+No ambiente Docker, que inclui Playwright e todas as dependencias:
+
+```bash
+docker compose run --rm --no-deps nfce-api \
+  python -m unittest discover -s tests -v
+```
+
+## Atualizacao segura
+
+O banco SQLite persistente fica em `data/market.db`. Antes de implantar uma
+nova versao:
+
+1. atualize o repositorio com `git pull --ff-only origin main`;
+2. pare a API com `docker compose stop nfce-api`;
+3. copie `data/market.db` para `backups/` usando um nome com data e hora;
+4. valide o backup com `PRAGMA integrity_check`;
+5. reconstrua e teste a imagem;
+6. inicie com `docker compose up -d --build nfce-api`;
+7. confirme `GET /health`, os logs e a integridade do banco.
+
+As pastas `data/` e `backups/` sao excluidas tanto do Git quanto do contexto de
+build do Docker. O procedimento completo, incluindo restauracao, esta em
+[`OPERACAO.md`](OPERACAO.md).
+
+As alteracoes funcionais de cada versao sao registradas em
+[`CHANGELOG.md`](CHANGELOG.md).
