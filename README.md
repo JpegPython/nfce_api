@@ -1,18 +1,34 @@
 # nfce_api
 API para leitura de dados de NFe, para organizaçao e analise de dados domésticos
 
-## Politica do scanner NFC-e
+## Configuracao local
 
-`POST /nfce` consulta a SEFAZ de forma serializada: se chegarem varias notas ao
-mesmo tempo, uma espera a outra. Isso reduz bloqueios por rajada.
-
-Variaveis de controle no Docker:
+Crie o arquivo de configuracao local a partir do exemplo:
 
 ```bash
+cp .env.example .env
+```
+
+O `.env` e ignorado pelo Git. Guarde nele IPs privados, portas, URLs de banco,
+senhas e outros valores especificos do ambiente. O `.env.example` deve conter
+somente valores seguros para documentacao.
+
+O Docker Compose carrega o `.env` automaticamente. As configuracoes disponiveis
+sao:
+
+```bash
+API_BIND_ADDRESS=127.0.0.1
+API_HOST_PORT=8001
+DATABASE_URL=sqlite:////app/data/market.db
 SEFAZ_MIN_INTERVAL_SECONDS=15
 SEFAZ_MAX_RETRIES=2
 SEFAZ_RETRY_BASE_SECONDS=5
 ```
+
+## Politica do scanner NFC-e
+
+`POST /nfce` consulta a SEFAZ de forma serializada: se chegarem varias notas ao
+mesmo tempo, uma espera a outra. Isso reduz bloqueios por rajada.
 
 Retries sao aplicados apenas para erros temporarios, como `429`, `5xx` e falhas
 de rede. `404` nao entra em retry: a API retorna `404` porque a SEFAZ informou

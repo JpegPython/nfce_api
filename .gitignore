@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -205,6 +207,7 @@ cython_debug/
 data/
 market.db
 last_nfce_debug.html
+sefaz_*_sample.html
 .hermes/
 
 # Marimo
