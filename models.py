@@ -17,6 +17,8 @@ class Compra(Base):
     mercado_endereco = Column(String)    # Endereço do mercado
     forma_pagamento = Column(String)     # Ex: Cartão, Dinheiro
 
+    chave_acesso = Column(String(44), unique=True, nullable=True)
+
     itens = relationship("ItemCompra", back_populates="compra")
 
 

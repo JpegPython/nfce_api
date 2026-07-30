@@ -20,6 +20,7 @@ erDiagram
         FLOAT desconto_total
         FLOAT valor_pago
         DATETIME data
+        STRING chave_acesso UK
         STRING mercado_nome
         STRING mercado_endereco
         STRING forma_pagamento
@@ -50,11 +51,15 @@ CREATE TABLE compras (
         desconto_total FLOAT,
         valor_pago FLOAT,
         data DATETIME,
+        chave_acesso VARCHAR(44),
         mercado_nome VARCHAR,
         mercado_endereco VARCHAR,
         forma_pagamento VARCHAR,
         PRIMARY KEY (id)
 );
+
+CREATE UNIQUE INDEX ix_compras_chave_acesso
+ON compras (chave_acesso);
 
 CREATE TABLE produtos (
         id INTEGER NOT NULL,
@@ -88,6 +93,7 @@ CREATE TABLE itens_compra (
 | desconto_total | FLOAT | - | Sim | Soma dos descontos |
 | valor_pago | FLOAT | - | Sim | Total final pago |
 | data | DATETIME | - | Sim | Data/hora da compra |
+| chave_acesso | VARCHAR(44) | UNIQUE | Sim | Chave da NFC-e usada para impedir importacao duplicada |
 | mercado_nome | VARCHAR | - | Sim | Nome do mercado |
 | mercado_endereco | VARCHAR | - | Sim | Endereco do mercado |
 | forma_pagamento | VARCHAR | - | Sim | Forma de pagamento |

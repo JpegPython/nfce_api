@@ -1,23 +1,30 @@
-﻿from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func
-
-from nfce_scraper import (
-    SefazBlockedError,
-    SefazNotFoundError,
-    SefazTemporaryError,
-    parse_nfce_html,
-    scrape_nfce,
-)
-from nfce_service import salvar_compra
 
 from database import SessionLocal, ensure_database_schema
 from models import Compra, ItemCompra, Produto
+from nfce_errors import NFCeError, NFCeParseError
+from nfce_qr import validate_nfce_qr_url
+from nfce_scraper import NFCE_MAX_HTML_CHARS, parse_nfce_document, scrape_nfce
+from nfce_service import buscar_compra_por_chave, salvar_compra
 
-# Criação das tabelas no banco
+
 ensure_database_schema()
 
 app = FastAPI()
+
+
+@app.exception_handler(NFCeError)
+async def nfce_error_handler(_request: Request, error: NFCeError):
+    return JSONResponse(
+        status_code=error.status_code,
+        content={
+            "detail": error.message,
+            **error.as_dict(),
+        },
+    )
 
 
 @app.get("/health")
@@ -30,61 +37,73 @@ class NFCeRequest(BaseModel):
 
 
 class NFCeHtmlRequest(BaseModel):
-    html: str
-    source_url: str | None = None
+    html: str = Field(min_length=1, max_length=NFCE_MAX_HTML_CHARS)
+    source_url: str
 
 
 def _salvar_resultado_nfce(resultado):
     items = resultado.get("items") or []
-    if len(items) == 0:
-        raise HTTPException(
-            status_code=422,
-            detail="Ocorreu um erro na leitura da nota: nenhum item foi identificado.",
+    if not items:
+        raise NFCeParseError(
+            "Ocorreu um erro na leitura da nota: nenhum item foi identificado."
         )
 
-    compra_id = salvar_compra(
+    save_result = salvar_compra(
         itens=items,
         data_compra=resultado["data_compra"],
         totals=resultado.get("totals"),
         mercado_nome=resultado.get("mercado_nome"),
         mercado_endereco=resultado.get("mercado_endereco"),
-        forma_pagamento=resultado.get("forma_pagamento")
+        forma_pagamento=resultado.get("forma_pagamento"),
+        chave_acesso=resultado.get("access_key"),
     )
 
     return {
-        "compra_id": compra_id,
+        "compra_id": save_result.compra_id,
+        "already_imported": save_result.already_imported,
         "data": resultado["data_compra"],
         "items": resultado["items"],
         "totals": resultado.get("totals"),
         "mercado_nome": resultado.get("mercado_nome"),
         "mercado_endereco": resultado.get("mercado_endereco"),
-        "forma_pagamento": resultado.get("forma_pagamento")
+        "forma_pagamento": resultado.get("forma_pagamento"),
+        "access_key": resultado.get("access_key"),
+        "qr": resultado.get("qr"),
+        "extraction": resultado.get("extraction"),
     }
+
+
+@app.post("/nfce/validate")
+def validate_nfce(data: NFCeRequest):
+    return validate_nfce_qr_url(data.url).as_dict()
 
 
 @app.post("/nfce")
 def read_nfce(data: NFCeRequest):
-    try:
-        resultado = scrape_nfce(data.url)
-    except SefazBlockedError as error:
-        raise HTTPException(status_code=424, detail=str(error))
-    except SefazNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error))
-    except SefazTemporaryError as error:
-        raise HTTPException(status_code=503, detail=str(error))
+    qr_data = validate_nfce_qr_url(data.url)
+    existing = buscar_compra_por_chave(qr_data.access_key)
+    if existing:
+        existing["qr"] = qr_data.as_dict()
+        return existing
 
+    resultado = scrape_nfce(data.url)
     return _salvar_resultado_nfce(resultado)
 
 
 @app.post("/nfce/html")
 def read_nfce_html(data: NFCeHtmlRequest):
-    try:
-        resultado = parse_nfce_html(data.html)
-    except SefazBlockedError as error:
-        raise HTTPException(status_code=424, detail=str(error))
-    except SefazNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error))
+    qr_data = validate_nfce_qr_url(data.source_url)
+    existing = buscar_compra_por_chave(qr_data.access_key)
+    if existing:
+        existing["qr"] = qr_data.as_dict()
+        return existing
 
+    resultado = parse_nfce_document(
+        data.html,
+        expected_access_key=qr_data.access_key,
+    )
+    resultado["access_key"] = qr_data.access_key
+    resultado["qr"] = qr_data.as_dict()
     return _salvar_resultado_nfce(resultado)
 
 
@@ -100,26 +119,31 @@ def listar_compras():
 
         for item in itens:
             produto = db.query(Produto).filter(Produto.id == item.produto_id).first()
-            lista_itens.append({
-                "produto": produto.nome if produto else None,
-                "quantidade": item.quantidade or 1.0,
-                "unidade": item.unidade or "UN",
-                "valor_unitario": item.valor_unitario or 0.0,
-                "preco_total": item.preco_total or 0.0,
-                "desconto": item.desconto or 0.0,
-            })
+            lista_itens.append(
+                {
+                    "produto": produto.nome if produto else None,
+                    "quantidade": item.quantidade or 1.0,
+                    "unidade": item.unidade or "UN",
+                    "valor_unitario": item.valor_unitario or 0.0,
+                    "preco_total": item.preco_total or 0.0,
+                    "desconto": item.desconto or 0.0,
+                }
+            )
 
-        resultado.append({
-            "compra_id": compra.id,
-            "data": compra.data,
-            "valor_bruto": compra.valor_bruto or 0.0,
-            "desconto_total": compra.desconto_total or 0.0,
-            "valor_pago": compra.valor_pago or 0.0,
-            "mercado_nome": compra.mercado_nome,
-            "mercado_endereco": compra.mercado_endereco,
-            "forma_pagamento": compra.forma_pagamento,
-            "itens": lista_itens
-        })
+        resultado.append(
+            {
+                "compra_id": compra.id,
+                "data": compra.data,
+                "valor_bruto": compra.valor_bruto or 0.0,
+                "desconto_total": compra.desconto_total or 0.0,
+                "valor_pago": compra.valor_pago or 0.0,
+                "mercado_nome": compra.mercado_nome,
+                "mercado_endereco": compra.mercado_endereco,
+                "forma_pagamento": compra.forma_pagamento,
+                "chave_acesso": compra.chave_acesso,
+                "itens": lista_itens,
+            }
+        )
 
     db.close()
     return resultado
@@ -130,7 +154,6 @@ def listar_gastos_mensais():
     db = SessionLocal()
 
     try:
-        # SQLite: agrupa por ano-mes usando strftime para manter ordenacao correta.
         rows = (
             db.query(
                 func.strftime("%Y-%m", Compra.data).label("ano_mes"),
@@ -157,5 +180,3 @@ def listar_gastos_mensais():
         return resultado
     finally:
         db.close()
-
-

@@ -36,3 +36,26 @@ def ensure_database_schema():
                     "REFERENCES produtos_canonicos(id)"
                 )
             )
+
+    compra_columns = {column["name"] for column in inspector.get_columns("compras")}
+    if "chave_acesso" not in compra_columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE compras ADD COLUMN chave_acesso VARCHAR(44)")
+            )
+
+    compra_inspector = inspect(engine)
+    unique_constraints = compra_inspector.get_unique_constraints("compras")
+    has_unique_access_key = any(
+        constraint.get("column_names") == ["chave_acesso"]
+        for constraint in unique_constraints
+    )
+
+    if not has_unique_access_key:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "ix_compras_chave_acesso ON compras (chave_acesso)"
+                )
+            )
