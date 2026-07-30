@@ -110,7 +110,11 @@ def read_nfce_html(data: NFCeHtmlRequest):
 @app.get("/compras")
 def listar_compras():
     db = SessionLocal()
-    compras = db.query(Compra).all()
+    compras = (
+        db.query(Compra)
+        .order_by(Compra.data.desc(), Compra.id.desc())
+        .all()
+    )
     resultado = []
 
     for compra in compras:

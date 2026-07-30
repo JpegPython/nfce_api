@@ -1,5 +1,11 @@
 # Historico de alteracoes
 
+## 2026-07-30 - Ordenacao das compras
+
+- `GET /compras` agora retorna as compras da mais recente para a mais antiga;
+- compras com a mesma data usam o maior `id` como desempate deterministico;
+- teste de regressao cobre os dois criterios de ordenacao.
+
 ## 2026-07-30 - Importacao NFC-e robustecida
 
 Versao base: commit `3d03d14`.
